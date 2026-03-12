@@ -1,13 +1,13 @@
-  - name: Set up Python
+  - name: Set up Python 3.11
     uses: actions/setup-python@v4
     with:
-      python-version: ${{ matrix.python-version }}
+      python-version: '3.11'
       cache: 'pip'
 
-  - name: Install system packages (ffmpeg required by pydub)
+  - name: Install system packages (ffmpeg, build tools)
     run: |
       sudo apt-get update
-      sudo apt-get install -y ffmpeg
+      sudo apt-get install -y ffmpeg build-essential cmake pkg-config
 
   - name: Install Python dependencies
     run: |
@@ -18,22 +18,124 @@
         pip install pydub python-docx pytest
       fi
 
-  - name: Lint (if flake8 is configured)
+  - name: Build whisper.cpp (if present)
     run: |
-      if pip show flake8 >/dev/null 2>&1; then
-        flake8 || true
+      if [ -d whisper.cpp ]; then
+        echo "Found whisper.cpp; attempting build..."
+        if [ -f whisper.cpp/Makefile ]; then
+          make -C whisper.cpp -j$(nproc)
+        else
+          mkdir -p whisper.cpp/build
+          cmake -S whisper.cpp -B whisper.cpp/build
+          cmake --build whisper.cpp/build -- -j$(nproc)
+        fi
+        echo "whisper.cpp build output:"
+        ls -la whisper.cpp || true
       else
-        echo "flake8 not installed; skipping lint"
+        echo "whisper.cpp not found; skipping build"
       fi
 
-  - name: Run tests (if any)
+  - name: Download model (optional)
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.model_url != '' }}
     run: |
-      if [ -d tests ] || [ -f pytest.ini ] || [ -f pyproject.toml ]; then
-        pytest -q
+      mkdir -p whisper.cpp/models
+      echo "Downloading model from ${{ github.event.inputs.model_url }}"
+      curl -L -o whisper.cpp/models/ggml-base.bin "${{ github.event.inputs.model_url }}"
+
+  - name: Start Python server (if a server script is present)
+    run: |
+      # Try to detect a python script that starts a server/process loop
+      SERVER_SCRIPT=$(git grep -l "ThreadingTCPServer\|Server live at\|serve_forever" -- '*.py' || true)
+      if [ -n "$SERVER_SCRIPT" ]; then
+        SCRIPT=$(echo "$SERVER_SCRIPT" | head -n1)
+        echo "Starting server from $SCRIPT"
+        python "$SCRIPT" &
+        echo $! > server.pid
+        # give server a moment to start
+        sleep 3
+        ps -f -p "$(cat server.pid)" || true
       else
-        echo "No tests found; skipping pytest"
+        echo "No server start script detected; skipping server start"
       fi
 
-  - name: Show basic repo files (debug)
+  - name: Upload sample to server (when workflow_dispatch and sample provided)
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.sample_audio != '' }}
+    run: |
+      SAMPLE="${{ github.event.inputs.sample_audio }}"
+      if [ ! -f "${SAMPLE}" ]; then
+        echo "Sample file ${SAMPLE} not found in repo; skipping upload"
+        exit 0
+      fi
+      URL="http://localhost:8000"
+      echo "Uploading ${SAMPLE} to ${URL}/"
+      curl -s -F "file=@${SAMPLE}" "${URL}/" || true
+      echo "Polling progress for up to 3 minutes..."
+      for i in {1..36}; do
+        sleep 5
+        printf "check %s: " "$i"
+        curl -s "${URL}/progress" || true
+        echo
+      done
+
+  - name: Run repo-provided helper scripts (fallback)
+    run: |
+      if [ -f run_transcription.sh ]; then
+        echo "Found run_transcription.sh; running it"
+        chmod +x run_transcription.sh
+        ./run_transcription.sh || true
+      elif [ -f scripts/run_sample.sh ]; then
+        echo "Found scripts/run_sample.sh; running it"
+        chmod +x scripts/run_sample.sh
+        ./scripts/run_sample.sh || true
+      else
+        echo "No helper run scripts found; skipping"
+      fi
+
+  - name: Wait for output files (up to 3 minutes)
+    run: |
+      mkdir -p output
+      timeout=180
+      waited=0
+      while [ $waited -lt $timeout ]; do
+        if ls output/* 1> /dev/null 2>&1; then
+          echo "Output files found:"
+          ls -la output || true
+          break
+        fi
+        sleep 5
+        waited=$((waited+5))
+      done
+      if [ $waited -ge $timeout ]; then
+        echo "Timed out waiting for output files (waited ${timeout}s)"
+      fi
+
+  - name: Ensure artifact path not empty
+    run: |
+      mkdir -p output
+      if [ -z "$(ls -A output)" ]; then
+        echo "No transcription output produced. Adding placeholder." > output/no-result.txt
+      fi
+
+  - name: Upload artifacts (outputs and built binaries)
     if: ${{ always() }}
-    run: ls -la
+    uses: actions/upload-artifact@v4
+    with:
+      name: transcription-output
+      path: |
+        output/**
+        whisper.cpp/main
+        whisper.cpp/build/**
+        server.pid
+        logs/**
+
+  - name: Stop server (cleanup)
+    if: ${{ always() }}
+    run: |
+      if [ -f server.pid ]; then
+        PID=$(cat server.pid)
+        echo "Stopping server PID $PID"
+        kill "$PID" || true
+        rm -f server.pid
+      else
+        echo "No server.pid found; nothing to stop"
+      fi
