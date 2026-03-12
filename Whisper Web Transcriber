@@ -2,318 +2,254 @@ import os
 import subprocess
 import threading
 import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import http.server
+import socketserver
 import cgi
+import shutil
+import logging
 from pydub import AudioSegment
 from docx import Document
 
+# --- CONFIGURATION ---
 PORT = 8000
 CHUNK_MINUTES = 10
 MODEL_PATH = "whisper.cpp/models/ggml-base.bin"
+WHISPER_EXE = "./whisper.cpp/main"
 
-progress = {"status": "idle", "percent": 0}
+# Global state for tracking progress
+progress = {"status": "idle", "percent": 0, "file_ready": False}
 
+# Ensure required directories exist
 for folder in ["uploads", "chunks", "output"]:
-    os.makedirs(folder, exist_ok=True)
+    if not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 HTML_PAGE = """
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-
-<title>Whisper Web Transcriber</title>
-
-<style>
-
-body{
-font-family:Arial;
-background:#f4f6f8;
-padding:40px
-}
-
-.container{
-background:white;
-padding:30px;
-border-radius:10px;
-max-width:600px;
-margin:auto
-}
-
-h2{
-margin-top:0
-}
-
-button{
-padding:10px 20px;
-font-size:16px
-}
-
-.progress{
-width:100%;
-background:#ddd;
-margin-top:20px;
-border-radius:5px
-}
-
-.bar{
-width:0%;
-height:20px;
-background:#4CAF50;
-border-radius:5px
-}
-
-</style>
-
-<script>
-
-function checkProgress(){
-
-fetch('/progress')
-.then(r=>r.json())
-.then(data=>{
-
-document.getElementById("bar").style.width=data.percent+"%"
-
-document.getElementById("status").innerText=data.status
-
-if(data.percent<100){
-
-setTimeout(checkProgress,2000)
-
-}
-
-})
-
-}
-
-</script>
-
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Whisper Web Transcriber</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #f4f7f9; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .card { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); width: 100%; max-width: 500px; }
+        h2 { color: #2c3e50; margin-top: 0; }
+        .form-group { margin: 20px 0; }
+        button { background: #3498db; color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; transition: 0.3s; }
+        button:hover { background: #2980b9; }
+        .progress-container { background: #eee; border-radius: 10px; height: 20px; width: 100%; margin: 20px 0; overflow: hidden; display: none; }
+        .progress-bar { background: #2ecc71; height: 100%; width: 0%; transition: width 0.4s; }
+        #status { color: #7f8c8d; font-size: 14px; text-align: center; }
+        .download-links { display: none; margin-top: 20px; border-top: 1px solid #eee; padding-top: 20px; text-align: center; }
+        .download-links a { color: #3498db; text-decoration: none; font-weight: bold; margin: 0 10px; }
+    </style>
 </head>
-
 <body>
+    <div class="card">
+        <h2>Transcribe Audio</h2>
+        <form id="uploadForm" enctype="multipart/form-data">
+            <div class="form-group">
+                <input type="file" name="file" id="fileInput" accept="audio/*,video/*" required>
+            </div>
+            <button type="submit" id="submitBtn">Start Transcription</button>
+        </form>
 
-<div class="container">
+        <div class="progress-container" id="progressContainer">
+            <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <p id="status">Ready.</p>
 
-<h2>Upload Audio File</h2>
+        <div class="download-links" id="downloadLinks">
+            <a href="/output/result.txt" download>Download .txt</a>
+            <a href="/output/result.docx" download>Download .docx</a>
+        </div>
+    </div>
 
-<form method="post" enctype="multipart/form-data" onsubmit="setTimeout(checkProgress,2000)">
+    <script>
+        const form = document.getElementById('uploadForm');
+        form.onsubmit = async (e) => {
+            e.preventDefault();
+            const formData = new FormData(form);
+            document.getElementById('submitBtn').disabled = true;
+            document.getElementById('progressContainer').style.display = 'block';
+            
+            fetch('/', { method: 'POST', body: formData });
+            checkProgress();
+        };
 
-<input type="file" name="file" required>
-
-<br><br>
-
-<button type="submit">Start Transcription</button>
-
-</form>
-
-<div class="progress">
-
-<div class="bar" id="bar"></div>
-
-</div>
-
-<p id="status"></p>
-
-</div>
-
+        function checkProgress() {
+            fetch('/progress')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('progressBar').style.width = data.percent + '%';
+                    document.getElementById('status').innerText = data.status;
+                    
+                    if (data.status === 'finished') {
+                        document.getElementById('downloadLinks').style.display = 'block';
+                        document.getElementById('submitBtn').disabled = false;
+                    } else if (data.status && data.status.startsWith('Error')) {
+                        document.getElementById('submitBtn').disabled = false;
+                    } else {
+                        setTimeout(checkProgress, 1500);
+                    }
+                })
+                .catch(err => {
+                    console.error('Progress check failed', err);
+                    setTimeout(checkProgress, 3000);
+                });
+        }
+    </script>
 </body>
-
 </html>
 """
 
-
-def split_audio(file):
-
-    audio = AudioSegment.from_file(file)
-
-    length = CHUNK_MINUTES * 60 * 1000
-
-    files = []
-
-    index = 0
-
-    for i in range(0, len(audio), length):
-
-        part = audio[i:i+length]
-
-        name = f"chunks/chunk_{index}.wav"
-
-        part.export(name, format="wav")
-
-        files.append(name)
-
-        index += 1
-
-    return files
-
-
-def run_whisper(file):
-
-    cmd = [
-        "./whisper.cpp/main",
-        "-m", MODEL_PATH,
-        "-f", file,
-        "-nt"
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    return result.stdout
-
-
-def transcribe_all(chunks):
-
-    text = ""
-
-    total = len(chunks)
-
-    for i, c in enumerate(chunks):
-
-        progress["status"] = f"processing {i+1}/{total}"
-
-        progress["percent"] = 10 + int((i / total) * 70)
-
-        text += run_whisper(c)
-
-    return text
-
-
-def export_results(text):
-
-    txt = "output/result.txt"
-    srt = "output/result.srt"
-    docx = "output/result.docx"
-
-    with open(txt, "w", encoding="utf-8") as f:
-        f.write(text)
-
-    with open(srt, "w", encoding="utf-8") as f:
-        f.write(text)
-
-    doc = Document()
-    doc.add_paragraph(text)
-    doc.save(docx)
-
-
 def process_audio(filepath):
+    global progress
+    try:
+        logging.info("Starting processing for %s", filepath)
+        # 1. Splitting & Normalizing
+        progress.update({"status": "Converting & Splitting...", "percent": 5})
+        audio = AudioSegment.from_file(filepath)
+        audio = audio.set_frame_rate(16000).set_channels(1)  # Crucial for whisper.cpp
 
-    progress["status"] = "splitting audio"
-    progress["percent"] = 5
+        chunk_length = CHUNK_MINUTES * 60 * 1000
+        chunks = []
+        for i, start in enumerate(range(0, len(audio), chunk_length)):
+            chunk_path = f"chunks/chunk_{i}.wav"
+            audio[start:start+chunk_length].export(chunk_path, format="wav")
+            chunks.append(chunk_path)
 
-    chunks = split_audio(filepath)
+        # 2. Transcribing
+        full_text = ""
+        for i, chunk in enumerate(chunks):
+            progress["status"] = f"Transcribing part {i+1}/{len(chunks)}..."
+            progress["percent"] = 10 + int((i / max(1, len(chunks))) * 80)
 
-    progress["status"] = "transcribing"
-    progress["percent"] = 10
+            cmd = [WHISPER_EXE, "-m", MODEL_PATH, "-f", chunk, "-nt"]
+            logging.info("Running whisper: %s", " ".join(cmd))
+            res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+            if res.returncode != 0:
+                logging.error("Whisper failed for %s: %s", chunk, res.stderr)
+                raise RuntimeError(f"Whisper failed: {res.stderr.strip()}")
+            full_text += res.stdout + "\n"
+            try:
+                os.remove(chunk)  # Cleanup chunk file
+            except Exception:
+                logging.warning("Failed to remove chunk %s", chunk)
 
-    text = transcribe_all(chunks)
+        # 3. Exporting
+        progress["status"] = "Generating files..."
+        with open("output/result.txt", "w", encoding="utf-8") as f:
+            f.write(full_text)
 
-    progress["status"] = "exporting files"
-    progress["percent"] = 90
+        doc = Document()
+        doc.add_heading('Transcription Export', 0)
+        doc.add_paragraph(full_text)
+        doc.save("output/result.docx")
 
-    export_results(text)
+        progress.update({"status": "finished", "percent": 100, "file_ready": True})
+        logging.info("Processing finished for %s", filepath)
+    except Exception as e:
+        logging.exception("Processing failed")
+        progress.update({"status": f"Error: {str(e)}", "percent": 0})
+    finally:
+        # Remove the uploaded file to avoid storage growth
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                logging.info("Removed uploaded file %s", filepath)
+        except Exception:
+            logging.warning("Could not remove uploaded file %s", filepath)
 
-    progress["status"] = "finished"
-    progress["percent"] = 100
-
-
-class Handler(BaseHTTPRequestHandler):
-
+class CustomHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-
         if self.path == "/":
-
             self.send_response(200)
-            self.send_header("Content-type", "text/html")
+            self.send_header("Content-type", "text/html; charset=utf-8")
             self.end_headers()
-
             self.wfile.write(HTML_PAGE.encode())
-
         elif self.path == "/progress":
-
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-
             self.wfile.write(json.dumps(progress).encode())
-
         elif self.path.startswith("/output/"):
-
-            try:
-
-                path = "." + self.path
-
-                with open(path, "rb") as f:
-                    data = f.read()
-
+            file_path = self.path.lstrip("/")
+            if os.path.exists(file_path):
                 self.send_response(200)
-
-                if path.endswith(".txt") or path.endswith(".srt"):
-                    self.send_header("Content-type", "text/plain")
-
-                elif path.endswith(".docx"):
-                    self.send_header(
-                        "Content-type",
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-
+                # Set appropriate content-type and attachment header
+                if file_path.endswith(".txt"):
+                    self.send_header("Content-type", "text/plain; charset=utf-8")
+                    disposition_name = "result.txt"
+                elif file_path.endswith(".docx"):
+                    self.send_header("Content-type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                    disposition_name = "result.docx"
+                else:
+                    self.send_header("Content-type", "application/octet-stream")
+                    disposition_name = os.path.basename(file_path)
+                self.send_header("Content-Disposition", f'attachment; filename="{disposition_name}"')
                 self.end_headers()
-
-                self.wfile.write(data)
-
-            except:
-
+                with open(file_path, "rb") as f:
+                    self.wfile.write(f.read())
+            else:
                 self.send_error(404)
-
         else:
-
             self.send_error(404)
 
-
     def do_POST(self):
+        # Build a proper environ for cgi.FieldStorage so CONTENT_LENGTH is known
+        try:
+            ctype = self.headers.get('Content-Type')
+            clen = self.headers.get('Content-Length', '0')
+            environ = {
+                'REQUEST_METHOD': 'POST',
+                'CONTENT_TYPE': ctype,
+                'CONTENT_LENGTH': clen
+            }
+            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ=environ)
 
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={"REQUEST_METHOD": "POST"}
-        )
+            if "file" in form:
+                file_item = form["file"]
+                raw_filename = getattr(file_item, 'filename', None)
+                if not raw_filename:
+                    self.send_error(400, "No filename provided")
+                    return
+                secure_name = os.path.basename(raw_filename)
+                # Basic sanitize: remove path separators and control chars
+                secure_name = secure_name.replace("/", "_").replace("\\", "_")
+                file_path = os.path.join("uploads", secure_name)
 
-        fileitem = form["file"]
+                with open(file_path, "wb") as f:
+                    # file_item.file might be a binary file-like
+                    shutil.copyfileobj(file_item.file, f)
 
-        filename = os.path.basename(fileitem.filename)
+                # Reset progress and start thread
+                global progress
+                progress = {"status": "Starting...", "percent": 0, "file_ready": False}
+                t = threading.Thread(target=process_audio, args=(file_path,))
+                t.daemon = True
+                t.start()
 
-        filepath = os.path.join("uploads", filename)
-
-        with open(filepath, "wb") as f:
-            f.write(fileitem.file.read())
-
-        thread = threading.Thread(target=process_audio, args=(filepath,))
-        thread.start()
-
-        response = """
-        <html>
-        <body>
-        <h3>Processing started</h3>
-        <p>Wait until progress reaches 100%</p>
-        <a href="/">Back</a>
-        </body>
-        </html>
-        """
-
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-
-        self.wfile.write(response.encode())
-
-
-def run():
-
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-
-    print("Server running at http://localhost:8000")
-
-    server.serve_forever()
-
+                self.send_response(200)
+                self.send_header("Content-type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"Processing started")
+            else:
+                self.send_error(400, "No file field in form")
+        except Exception as e:
+            logging.exception("Failed handling POST")
+            self.send_error(500, f"Server error: {e}")
 
 if __name__ == "__main__":
-    run()
+    logging.info("Server live at http://localhost:%s", PORT)
+    # Use a threaded server so multiple clients can query progress concurrently
+    with socketserver.ThreadingTCPServer(("", PORT), CustomHandler) as httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            logging.info("Shutting down server")
+            httpd.shutdown()
